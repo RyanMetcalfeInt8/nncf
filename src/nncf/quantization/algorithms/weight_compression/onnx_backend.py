@@ -249,6 +249,11 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
     ) -> onnx.ModelProto:
         self._check_arguments_for_transform_model(lora_correction_algo, compression_format)
         opset_version = model.opset_import[0].version
+        decompression_dtype = advanced_parameters.onnx_decompression_dtype if advanced_parameters else None
+        if decompression_dtype not in (None, "float16"):
+            raise nncf.ParameterNotSupportedError('onnx_decompression_dtype must be None or "float16"')
+        if decompression_dtype is not None and opset_version < 19:
+            raise nncf.ParameterNotSupportedError("float16 ONNX decompression requires opset 19 or later")
 
         for wc_params in weight_compression_parameters:
             compression_config = wc_params.compression_config
@@ -257,11 +262,18 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             precomputed_compressed_weights = precomputed_compressed_weights or {}
 
             dequantize_block_size = max(compression_config.group_size, 0)  # 0 - is no block wise quantization
-            dequantize_axis = (
-                get_weight_quantization_axis(node, wc_params.weight_port_id) if dequantize_block_size <= 0 else 0
-            )  # axis = 0 when blockwise
-
             reduction_axes = wc_params.reduction_axes
+            if dequantize_block_size > 0:
+                # Blockwise DQ axis denotes the dimension split into groups,
+                # not the output-channel dimension used by per-channel DQ.
+                # Transposed weights can group along axis 1 instead of axis 0.
+                if len(reduction_axes) != 1:
+                    raise nncf.ParameterNotSupportedError(
+                        "ONNX blockwise decompression requires a single reduction axis"
+                    )
+                dequantize_axis = reduction_axes[0]
+            else:
+                dequantize_axis = get_weight_quantization_axis(node, wc_params.weight_port_id)
             if node.metatype == onnx_metatypes.ONNXGemmMetatype and opset_version < 21 and dequantize_block_size > 0:
                 attr_name = "transB" if wc_params.weight_port_id == 1 else "transA"
                 transpose = node.layer_attributes.node_attrs[attr_name]
@@ -281,6 +293,8 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             # For opsets earlier than 21, we use the `MatMulNBits` operation from ONNX Runtime contrib operators.
             # See https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md
             if opset_version < 21 and dequantize_block_size > 0:
+                if decompression_dtype is not None:
+                    raise nncf.ParameterNotSupportedError("onnx_decompression_dtype does not support MatMulNBits")
                 if len(weight.shape) == 3:
                     msg = """ONNX does not support 3D weights for opset version < 21.
                              Please use a higher opset version or per-channel quantization"""
@@ -313,6 +327,9 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                     dequantize_block_size,
                     wc_params.weight_name,
                     self._get_weight_dtype(compression_config.mode),
+                    scale_dtype=onnx.TensorProto.FLOAT16 if decompression_dtype else onnx.TensorProto.FLOAT,
+                    output_dtype=node.layer_attributes.weight_attrs[wc_params.weight_port_id]["dtype"]
+                    if decompression_dtype else None,
                 )
         return model
 
@@ -347,6 +364,7 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         weight_name: str,
         weight_dtype: onnx.TensorProto.DataType,
         scale_dtype: onnx.TensorProto.DataType = onnx.TensorProto.FLOAT,
+        output_dtype: onnx.TensorProto.DataType | None = None,
     ) -> None:
         """
         Add a DequantizeLinear node to the ONNX model to dequantize the weights.
@@ -359,6 +377,7 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         :param weight_name: The name of the weight tensor.
         :param weight_dtype: The data type of the weight tensor.
         :param scale_dtype: The data type of the scale tensor (default is FLOAT).
+        :param output_dtype: Cast decompressed weights to this type when different from scale_dtype.
         :return: The modified ONNX model with the DequantizeLinear node added.
         """
         orig_shape = quantized_weights.shape
@@ -368,6 +387,9 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         quantized_weight_name = weight_name + "_quantized"
         scale_name = weight_name + "_scale"
         dequantized_weight_output = weight_name + "_dequantized"
+        cast_output = dequantized_weight_output
+        if output_dtype is not None and output_dtype != scale_dtype:
+            dequantized_weight_output += "_before_cast"
         deq_inputs = [quantized_weight_name, scale_name]
 
         if weight_dtype in [onnx.TensorProto.INT4, onnx.TensorProto.UINT4]:
@@ -432,6 +454,19 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
         # Insert the DequantizeLinear node before the first consumer node
         model.graph.node.insert(insert_index, dequantize_node)
+        if output_dtype is not None and output_dtype != scale_dtype:
+            cast_node = helper.make_node(
+                "Cast", [dequantized_weight_output], [cast_output], to=output_dtype,
+                name=f"{weight_name}_DequantizeCast",
+            )
+            # Consumers keep the original floating-point interface.
+            for node in model.graph.node:
+                if node is dequantize_node or node.name == dequantize_node.name:
+                    continue
+                for j, input_name in enumerate(node.input):
+                    if input_name == dequantized_weight_output:
+                        node.input[j] = cast_output
+            model.graph.node.insert(insert_index + 1, cast_node)
         # Remove original weight initializer
         remove_initializer(weight_name, model)
         # Update the node mapping
