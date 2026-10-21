@@ -139,6 +139,10 @@ def get_weight_quantization_axis(node: NNCFNode, port_id: int) -> int:
         weight_channel_axis = -1 - port_id if transpose else -2 + port_id
     if node.metatype == om.ONNXMatMulMetatype:
         weight_channel_axis = -1 - port_id if port_id == 0 else -2 + port_id
+    if node.metatype in (om.ONNXMatMulMetatype, om.ONNXGemmMetatype):
+        axis_map = node.layer_attributes.weight_attrs[port_id].get("source_axis_map")
+        if axis_map is not None:
+            weight_channel_axis = axis_map[weight_channel_axis]
     return weight_channel_axis
 
 
