@@ -423,6 +423,23 @@ class GraphConverter:
                         "dtype": dtype,
                         "weight_input_shape": weight_input_shape,
                     }
+                    # Map consumed tensor axes back to the original constant.
+                    # Shape alone cannot identify permutations (e.g. square weights).
+                    edge_name = node.input[weight_port_id]
+                    axis_map = list(range(len(weight_input_shape)))
+                    while edge_name != weight_edge_name:
+                        producer = parents_node_mapping.get(edge_name)
+                        if producer is None or producer.op_type != "Transpose":
+                            axis_map = None
+                            break
+                        perm = next(
+                            (list(onnx.helper.get_attribute_value(a)) for a in producer.attribute if a.name == "perm"),
+                            list(reversed(range(len(axis_map)))),
+                        )
+                        axis_map = [perm[axis] for axis in axis_map]
+                        edge_name = producer.input[0]
+                    if axis_map is not None and edge_name == weight_edge_name:
+                        weight_attrs[weight_port_id]["source_axis_map"] = axis_map
 
                     # The weight tensor is shared if there is more than one consumer of this weight tensor.
                     is_weight_shared = len(children_node_mapping[weight_edge_name]) > 1
