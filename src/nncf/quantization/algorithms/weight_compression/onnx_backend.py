@@ -380,6 +380,20 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         :param output_dtype: Cast decompressed weights to this type when different from scale_dtype.
         :return: The modified ONNX model with the DequantizeLinear node added.
         """
+        restore_shape = None
+        if block_size == 0 and scale.ndim > 1:
+            # Several channel dimensions cannot be represented by ordinary
+            # per-axis DQ. Collapse the channel prefix, then restore the weight.
+            if tuple(quantized_weights.shape[:scale.ndim]) != tuple(scale.shape):
+                raise nncf.ParameterNotSupportedError(
+                    "ONNX per-channel decompression requires scales matching the weight channel prefix"
+                )
+            restore_shape = quantized_weights.shape
+            quantized_weights = quantized_weights.reshape((scale.size, *restore_shape[scale.ndim:]))
+            scale = scale.reshape(-1)
+            if zero_point is not None:
+                zero_point = zero_point.reshape(-1)
+            axis = 0
         orig_shape = quantized_weights.shape
         if zero_point is not None:
             orig_zero_point_shape = zero_point.shape
@@ -390,6 +404,10 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         cast_output = dequantized_weight_output
         if output_dtype is not None and output_dtype != scale_dtype:
             dequantized_weight_output += "_before_cast"
+        restored_output = cast_output
+        if restore_shape is not None:
+            dequantized_weight_output += "_flattened"
+            cast_output += "_flattened_cast"
         deq_inputs = [quantized_weight_name, scale_name]
 
         if weight_dtype in [onnx.TensorProto.INT4, onnx.TensorProto.UINT4]:
@@ -471,6 +489,21 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         remove_initializer(weight_name, model)
         # Update the node mapping
         self.name_to_node_map[dequantize_node.name] = dequantize_node
+        if restore_shape is not None:
+            source = cast_output if output_dtype is not None and output_dtype != scale_dtype else dequantized_weight_output
+            # Rewire existing consumers before inserting the restoring Reshape.
+            for consumer in model.graph.node:
+                if consumer.name == dequantize_node.name or consumer.name == f"{weight_name}_DequantizeCast":
+                    continue
+                for j, input_name in enumerate(consumer.input):
+                    if input_name == source:
+                        consumer.input[j] = restored_output
+            shape_name = weight_name + "_dequantized_shape"
+            model.graph.initializer.append(numpy_helper.from_array(np.asarray(restore_shape, dtype=np.int64), shape_name))
+            offset = 2 if output_dtype is not None and output_dtype != scale_dtype else 1
+            model.graph.node.insert(insert_index + offset, helper.make_node(
+                "Reshape", [source, shape_name], [restored_output], name=weight_name + "_DequantizeReshape"
+            ))
         return model
 
     def _replace_matmul_with_matmulnbits(
