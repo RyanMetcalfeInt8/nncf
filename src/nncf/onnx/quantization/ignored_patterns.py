@@ -8,6 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from copy import deepcopy
 from typing import Callable
 
 from nncf.common.graph.patterns.patterns import GraphPattern
@@ -182,6 +183,10 @@ def create_rope() -> GraphPattern:
     pattern.add_edge(transpose_node, concat_node)
     pattern.add_edge(concat_node, cos_node)
     pattern.add_edge(concat_node, sin_node)
+    # Concat(x, x) has two parallel producer edges in the ONNX graph.
+    duplicate_input_pattern = deepcopy(pattern)
+    duplicate_input_pattern.add_edge(transpose_node, concat_node)
+    pattern.add_pattern_alternative(duplicate_input_pattern)
     return pattern
 
 
