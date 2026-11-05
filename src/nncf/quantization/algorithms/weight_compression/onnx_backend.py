@@ -257,11 +257,18 @@ class ONNXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             precomputed_compressed_weights = precomputed_compressed_weights or {}
 
             dequantize_block_size = max(compression_config.group_size, 0)  # 0 - is no block wise quantization
-            dequantize_axis = (
-                get_weight_quantization_axis(node, wc_params.weight_port_id) if dequantize_block_size <= 0 else 0
-            )  # axis = 0 when blockwise
-
             reduction_axes = wc_params.reduction_axes
+            if dequantize_block_size > 0:
+                # Blockwise DQ axis denotes the dimension split into groups,
+                # not the output-channel dimension used by per-channel DQ.
+                # Transposed weights can group along axis 1 instead of axis 0.
+                if len(reduction_axes) != 1:
+                    raise nncf.ParameterNotSupportedError(
+                        "ONNX blockwise decompression requires a single reduction axis"
+                    )
+                dequantize_axis = reduction_axes[0]
+            else:
+                dequantize_axis = get_weight_quantization_axis(node, wc_params.weight_port_id)
             if node.metatype == onnx_metatypes.ONNXGemmMetatype and opset_version < 21 and dequantize_block_size > 0:
                 attr_name = "transB" if wc_params.weight_port_id == 1 else "transA"
                 transpose = node.layer_attributes.node_attrs[attr_name]
