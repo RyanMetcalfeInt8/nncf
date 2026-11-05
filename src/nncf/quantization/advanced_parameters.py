@@ -437,6 +437,11 @@ class AdvancedCompressionParameters:
     :type codebook: TTensor
     :param adaptive_codebook_params: Advanced parameters for adaptive codebook estimation.
     :type adaptive_codebook_params: AdvancedAdaptiveCodebookParameters
+    :param onnx_decompression_dtype: Optional ONNX weight decompression precision.
+        None preserves existing behavior. "float16" stores f16 scales, emits
+        f16 DequantizeLinear and casts back to the original weight dtype.
+        Changes rounding; requires opset 19 or later. ONNX backend only.
+    :type onnx_decompression_dtype: str | None
     """
 
     statistics_path: str | None = None
@@ -454,6 +459,7 @@ class AdvancedCompressionParameters:
     adaptive_codebook_params: AdvancedAdaptiveCodebookParameters = field(
         default_factory=AdvancedAdaptiveCodebookParameters
     )
+    onnx_decompression_dtype: str | None = None
 
 
 @api(canonical_alias="nncf.ScopedConfig")
